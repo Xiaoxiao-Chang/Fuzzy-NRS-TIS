@@ -1,0 +1,313 @@
+# -*- coding: utf-8 -*-
+"""
+Phase-2: Temporal State Estimation and Trend Classification
+
+This module implements the second-stage methodology described in the manuscript,
+including:
+
+- Linear Gaussian state-space modeling
+- Parameter learning via the EM algorithm
+- Rauch–Tung–Striebel (RTS) smoothing
+- Standardized difference statistics (Δz / σΔ)
+- Benjamini–Hochberg FDR control for high-confidence thresholding
+- EWMA-based temporal evidence accumulation
+- Three-way decision outputs: Improved / Worsened / Observe
+
+This script provides a reference implementation consistent with the Phase-2
+methodology described in the paper.
+"""
+
+import os
+import math
+import json
+from pathlib import Path
+from datetime import datetime
+from typing import Dict, Tuple, List
+
+import numpy as np
+import pandas as pd
+from scipy.stats import norm
+import matplotlib
+import matplotlib.pyplot as plt
+import matplotlib.lines as mlines
+import matplotlib.patches as mpatches
+
+# ================== Path configuration ==================
+
+INPUT_XLSX     = r"C:\Users\Lenovo\Desktop\实验数据9月\信息系统最终编号版.xlsx"
+REDUCTION_XLSX = r"C:\Users\Lenovo\Desktop\实验数据9月\每位对象_约简与权重汇总new.xlsx"
+OUTPUT_XLSX    = r"C:\Users\Lenovo\Desktop\实验数据9月\Phase2_state_trend_results.xlsx"
+PLOT_DIR       = r"C:\Users\Lenovo\Desktop\实验数据9月\Phase2_trend_plots"
+GLOBAL_DIR     = r"C:\Users\Lenovo\Desktop\实验数据9月\Phase2_global_plots"
+REPORT_HTML    = r"C:\Users\Lenovo\Desktop\实验数据9月\Phase2_report.html"
+
+VERBOSE = True
+
+# ================== Timestamp ==================
+
+TS = datetime.now().strftime("%Y%m%d-%H%M%S")
+
+def append_ts_to_path(path: str, ts: str = TS) -> str:
+    p = Path(path)
+    return str(p.with_name(p.stem + "_" + ts + p.suffix))
+
+# ================== Decision / Statistical Parameters ==================
+
+ALPHA_FDR = 0.20        # Target significance level for BH-FDR
+USE_EWMA  = True
+EWMA_BETA = 0.35
+U_EWMA    = None        # If None: u_ewma = max(0.22, 0.8 * u_used)
+
+SECONDARY_FRAC = 0.5    # Secondary threshold coefficient: u_lo = SECONDARY_FRAC * u_used
+
+SDZ_MIN = 1e-8
+USE_FILTERED_DIFFS = False
+
+# ================== Kalman / EM Parameters ==================
+
+EM_MAX_ITERS = 100
+EM_TOL       = 1e-5
+
+INIT_A  = 1.0
+INIT_Q  = 0.12
+INIT_R  = 0.01
+INIT_X0 = 0.0
+INIT_P0 = 1.0
+
+Q_MAX    = 1.20
+R_MAX    = 0.05
+R_SHRINK = 0.20
+
+EPS = 1e-12
+
+# ================== Matplotlib setup ==================
+
+def setup_matplotlib():
+    matplotlib.rcParams["font.sans-serif"] = ["DejaVu Sans"]
+    matplotlib.rcParams["axes.unicode_minus"] = False
+    matplotlib.rcParams["pdf.fonttype"] = 42
+    matplotlib.rcParams["ps.fonttype"]  = 42
+    matplotlib.rcParams["figure.dpi"]   = 150
+    matplotlib.rcParams["savefig.dpi"]  = 300
+    matplotlib.rcParams["axes.grid"]    = True
+    matplotlib.rcParams["grid.linestyle"] = "--"
+    matplotlib.rcParams["grid.alpha"]     = 0.25
+
+# ================== Utility functions ==================
+
+def t_sort_key(tval):
+    if pd.isna(tval):
+        return math.inf
+    s = str(tval)
+    digits = "".join(ch for ch in s if ch.isdigit())
+    if digits:
+        try:
+            return int(digits)
+        except Exception:
+            pass
+    try:
+        return float(s)
+    except Exception:
+        return s
+
+# ================== Read Phase-1 weights ==================
+
+def read_reduction_weights(xlsx_path: str) -> Dict[str, Dict[str, float]]:
+    """
+    Return a dictionary:
+        { pid: {attribute: weight, ...}, ... }
+    """
+    xls = pd.ExcelFile(xlsx_path)
+    out = {}
+
+    for sheet in xls.sheet_names:
+        if sheet.endswith("_weights"):
+            pid = sheet[:-len("_weights")]
+            dfw = pd.read_excel(xls, sheet_name=sheet)
+            dfw.columns = [str(c).strip() for c in dfw.columns]
+            if "attribute" not in dfw.columns or "weight" not in dfw.columns:
+                continue
+            cur = {
+                str(r["attribute"]).strip(): float(r["weight"])
+                for _, r in dfw.iterrows()
+                if pd.notna(r["attribute"]) and pd.notna(r["weight"])
+            }
+            s = sum(cur.values())
+            if s > 0:
+                cur = {k: v/s for k, v in cur.items()}
+            out[pid] = cur
+    return out
+
+# ================== Observation construction ==================
+
+def normalize_ct(c: np.ndarray) -> np.ndarray:
+    n = float(np.linalg.norm(c))
+    return c / max(n, EPS)
+
+def assemble_ct_and_yt(row: pd.Series, weights: Dict[str, float]):
+    elems = []
+    for a, w in weights.items():
+        if a in row.index and pd.notna(row[a]):
+            elems.append((a, float(row[a]), float(w)))
+    if not elems:
+        return None, None
+    y = np.array([v for (_, v, _) in elems], dtype=float).reshape(-1, 1)
+    c = np.array([w for (_, _, w) in elems], dtype=float).reshape(-1, 1)
+    return normalize_ct(c), y
+
+# ================== Kalman / RTS / EM ==================
+
+def kalman_filter(y_list, C_list, A, Q, R, x0, P0):
+    T = len(y_list)
+    x_pred = np.zeros(T)
+    P_pred = np.zeros(T)
+    x_filt = np.zeros(T)
+    P_filt = np.zeros(T)
+
+    for t in range(T):
+        if t == 0:
+            x_pred[t], P_pred[t] = x0, P0
+        else:
+            x_pred[t] = A * x_filt[t-1]
+            P_pred[t] = A * P_filt[t-1] * A + Q
+
+        Ct, yt = C_list[t], y_list[t]
+        if Ct is None:
+            x_filt[t], P_filt[t] = x_pred[t], P_pred[t]
+            continue
+
+        S = (Ct @ Ct.T) * P_pred[t] + R * np.eye(Ct.shape[0])
+        K = (P_pred[t] * Ct.T) @ np.linalg.inv(S)
+        innov = yt - Ct * x_pred[t]
+        x_filt[t] = x_pred[t] + float((K @ innov).ravel())
+        P_filt[t] = P_pred[t] - float(P_pred[t]**2 * (Ct.T @ np.linalg.inv(S) @ Ct).ravel())
+
+    return x_pred, P_pred, x_filt, P_filt
+
+def rts_smoother(A, Q, x_pred, P_pred, x_filt, P_filt):
+    T = len(x_filt)
+    xs = np.zeros(T)
+    Ps = np.zeros(T)
+    Plag = np.zeros(T)
+
+    xs[-1], Ps[-1] = x_filt[-1], P_filt[-1]
+    for t in reversed(range(T-1)):
+        G = P_filt[t] * A / max(P_pred[t+1], EPS)
+        xs[t] = x_filt[t] + G * (xs[t+1] - x_pred[t+1])
+        Ps[t] = P_filt[t] + G**2 * (Ps[t+1] - P_pred[t+1])
+        Plag[t+1] = G * Ps[t+1]
+
+    return xs, Ps, Plag
+
+def em_learn(y_list, C_list, A, Q, R, x0, P0):
+    for _ in range(EM_MAX_ITERS):
+        x_pred, P_pred, x_filt, P_filt = kalman_filter(
+            y_list, C_list, A, Q, R, x0, P0
+        )
+        xs, Ps, Plag = rts_smoother(A, Q, x_pred, P_pred, x_filt, P_filt)
+
+        T = len(xs)
+        Exx = Ps + xs**2
+        Exx1 = Plag + np.concatenate(([0.0], xs[:-1]*xs[1:]))
+
+        A = float(np.sum(Exx1[1:]) / max(np.sum(Exx[:-1]), EPS))
+        Q = float(np.mean(Exx[1:] - 2*A*Exx1[1:] + A*A*Exx[:-1]))
+        Q = np.clip(Q, EPS, Q_MAX)
+
+        R_acc, cnt = 0.0, 0
+        for t in range(T):
+            if C_list[t] is None:
+                continue
+            resid = y_list[t] - C_list[t] * xs[t]
+            R_acc += float((resid.T @ resid).ravel())
+            cnt += C_list[t].shape[0]
+        R = np.clip((1-R_SHRINK)*(R_acc/max(cnt,1)) + R_SHRINK*INIT_R, EPS, R_MAX)
+
+    return rts_smoother(A, Q, *kalman_filter(y_list, C_list, A, Q, R, x0, P0))
+
+# ================== Statistics and labeling ==================
+
+def diff_and_sigma(xs, Ps, Plag):
+    dz = xs[1:] - xs[:-1]
+    var = Ps[1:] + Ps[:-1] - 2.0*Plag[1:]
+    return dz, np.sqrt(np.maximum(var, SDZ_MIN))
+
+def bh_fdr_threshold(pvals, alpha):
+    p = np.sort(pvals[np.isfinite(pvals)])
+    m = len(p)
+    if m == 0:
+        return np.nan
+    line = alpha * np.arange(1, m+1) / m
+    idx = np.where(p <= line)[0]
+    return p[idx[-1]] if idx.size > 0 else np.nan
+
+def ewma_accumulate(r, beta):
+    e = np.zeros_like(r)
+    acc = 0.0
+    for i, v in enumerate(r):
+        acc = (1-beta)*acc + beta*(v if np.isfinite(v) else 0.0)
+        e[i] = acc
+    return e
+
+def blended_labels(base, ew, r, u, u_ewma):
+    out = []
+    u_lo = SECONDARY_FRAC * u
+    for b, e, rv in zip(base, ew, r):
+        lab = b
+        if lab == "Observe" and np.isfinite(e):
+            if e >= u_ewma:
+                lab = "Improved"
+            elif e <= -u_ewma:
+                lab = "Worsened"
+        if lab == "Observe" and np.isfinite(rv) and abs(rv) >= u_lo:
+            lab = "Improved" if rv > 0 else "Worsened"
+        out.append(lab)
+    return out
+
+# ================== Main ==================
+
+def main():
+    setup_matplotlib()
+
+    weights_map = read_reduction_weights(REDUCTION_XLSX)
+    df = pd.read_excel(INPUT_XLSX)
+
+    id_col, time_col = df.columns[:2]
+    attr_cols = df.columns[2:]
+
+    writer = pd.ExcelWriter(append_ts_to_path(OUTPUT_XLSX), engine="openpyxl")
+
+    for pid, wmap in weights_map.items():
+        sub = df[df[id_col] == pid].sort_values(time_col, key=lambda s: s.map(t_sort_key))
+        C_list, y_list = [], []
+        for _, row in sub.iterrows():
+            Ct, yt = assemble_ct_and_yt(row[attr_cols], wmap)
+            C_list.append(Ct)
+            y_list.append(yt)
+
+        xs, Ps, Plag = em_learn(y_list, C_list, INIT_A, INIT_Q, INIT_R, INIT_X0, INIT_P0)
+
+        dz, sdz = diff_and_sigma(xs, Ps, Plag)
+        r = dz / sdz
+        pvals = 2*(1-norm.cdf(np.abs(r)))
+        p_star = bh_fdr_threshold(pvals, ALPHA_FDR)
+        u = norm.ppf(1-p_star/2) if np.isfinite(p_star) else norm.ppf(1-ALPHA_FDR/2)
+
+        base = ["Improved" if rv>=u else "Worsened" if rv<=-u else "Observe" for rv in r]
+
+        ew = ewma_accumulate(r, EWMA_BETA)
+        u_ewma = max(0.22, 0.8*u) if U_EWMA is None else U_EWMA
+
+        final = blended_labels(base, ew, r, u, u_ewma)
+
+        out_df = pd.DataFrame({
+            time_col: sub[time_col].values,
+            "z": xs,
+            "label": ["—"] + final
+        })
+        out_df.to_excel(writer, sheet_name=str(pid), index=False)
+
+    writer.close()
+
+if __name__ == "__main__":
+    main()
