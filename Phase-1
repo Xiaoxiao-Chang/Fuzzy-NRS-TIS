@@ -1,0 +1,263 @@
+# Phase-1: Unsupervised Attribute Reduction and Weight Learning
+# Reference implementation corresponding to Section 5 of the IP&M manuscript.
+
+import os
+import math
+from pathlib import Path
+from typing import List, Tuple, Dict
+
+import numpy as np
+import pandas as pd
+
+import matplotlib
+import matplotlib.pyplot as plt
+
+# ===================== Global configuration =====================
+
+# Coefficients of the unified unsupervised objective Q
+ALPHA_ACC = 0.15
+BETA_BW   = 0.20
+GAMMA_CON = 0.65
+LAMBDA_L2 = 1e-3
+
+# Multi-β neighborhood thresholds (consistent with the manuscript)
+BETA_LEVELS = [0.5, 0.7, 0.9]
+
+# Selection constraints
+MIN_OBS_PER_ATTR = 4
+MIN_SELECTED     = 4
+MAX_SELECTED     = 9
+MARGINAL_EPS     = 1e-3
+
+# Numerical stability
+SIGMA_FLOOR      = 0.10
+EPS_DENOM        = 1e-8
+EPS_WEIGHT_FLOOR = 1e-4
+
+SEED = 42
+rng  = np.random.default_rng(SEED)
+
+# I/O paths
+INPUT_PATHS = [
+    r"C:\Users\Lenovo\Desktop\实验数据9月\信息系统最终编号版.xlsx",
+    r"/mnt/data/信息系统最终编号版.xlsx",
+]
+OUTPUT_XLSX = r"C:\Users\Lenovo\Desktop\实验数据9月\Phase1_reduction_summary.xlsx"
+FIG_DIR     = r"C:\Users\Lenovo\Desktop\实验数据9月\Phase1_figs"
+Path(FIG_DIR).mkdir(parents=True, exist_ok=True)
+
+# Matplotlib configuration
+matplotlib.rcParams["font.sans-serif"] = ["DejaVu Sans"]
+matplotlib.rcParams["axes.unicode_minus"] = False
+matplotlib.rcParams["pdf.fonttype"] = 42
+matplotlib.rcParams["ps.fonttype"]  = 42
+matplotlib.rcParams["figure.dpi"]   = 150
+matplotlib.rcParams["savefig.dpi"]  = 300
+
+
+# ===================== Utility functions =====================
+
+def choose_existing_path(paths: List[str]) -> str:
+    for p in paths:
+        if os.path.exists(p):
+            return p
+    raise FileNotFoundError("Input file not found.")
+
+def t_sort_key(tval):
+    if pd.isna(tval):
+        return math.inf
+    s = str(tval)
+    digits = ''.join(ch for ch in s if ch.isdigit())
+    if digits:
+        try:
+            return int(digits)
+        except Exception:
+            pass
+    try:
+        return float(s)
+    except Exception:
+        return s
+
+def estimate_sigma(series: pd.Series) -> float:
+    arr = pd.to_numeric(series, errors='coerce').dropna().values
+    if arr.size < 2:
+        return SIGMA_FLOOR
+    return max(SIGMA_FLOOR, 0.5 * np.std(arr))
+
+def gaussian_sim(x: float, y: float, sigma: float) -> float:
+    if np.isnan(x) or np.isnan(y):
+        return np.nan
+    s = max(SIGMA_FLOOR, sigma)
+    return float(np.exp(- ((x - y) ** 2) / (2.0 * s * s)))
+
+
+# ===================== Similarity and neighborhoods =====================
+
+def build_similarity(values: pd.DataFrame,
+                     attrs: List[str],
+                     weights: Dict[str, float]) -> Tuple[np.ndarray, np.ndarray]:
+    n = len(values)
+    S = np.zeros((n, n), dtype=float)
+    C = np.zeros((n, n), dtype=float)
+
+    sigmas = {a: estimate_sigma(values[a]) for a in attrs}
+
+    for a in attrs:
+        col = pd.to_numeric(values[a], errors='coerce').values
+        w_a = float(weights.get(a, 0.0))
+        if w_a <= 0:
+            continue
+        sigma_a = sigmas[a]
+        for i in range(n):
+            xi = col[i]
+            for j in range(i, n):
+                xj = col[j]
+                if not (np.isnan(xi) or np.isnan(xj)):
+                    s = gaussian_sim(xi, xj, sigma_a)
+                    S[i, j] += w_a * s
+                    S[j, i] += w_a * s
+                    C[i, j] += w_a
+                    C[j, i] += w_a
+
+    with np.errstate(divide='ignore', invalid='ignore'):
+        S = np.where(C > 0, S / np.maximum(C, EPS_DENOM), np.nan)
+
+    mask = ~np.isnan(S)
+    np.fill_diagonal(S, 1.0)
+    np.fill_diagonal(mask, True)
+    return S, mask
+
+def quantile_thresholds(S: np.ndarray,
+                        mask: np.ndarray,
+                        levels: List[float]) -> List[float]:
+    idx = np.triu_indices(S.shape[0], k=1)
+    vals = S[idx][mask[idx]]
+    if vals.size == 0:
+        return [0.0] * len(levels)
+    return [float(np.quantile(vals, q)) for q in levels]
+
+def neighborhoods_from_S(S: np.ndarray,
+                         thresholds: List[float]) -> List[List[set]]:
+    n = S.shape[0]
+    fam_all = []
+    for thr in thresholds:
+        fam = []
+        for i in range(n):
+            fam.append(set(np.where(np.isfinite(S[i]) & (S[i] >= thr))[0]))
+        fam_all.append(fam)
+    return fam_all
+
+
+# ===================== Rough-set-based evaluation =====================
+
+def lower_upper_from_cover(cover: List[set], X: set) -> Tuple[set, set]:
+    lower, upper = set(), set()
+    for N in cover:
+        if not N:
+            continue
+        if N.issubset(X):
+            lower |= N
+            upper |= N
+        elif N & X:
+            upper |= N
+    return lower, upper
+
+def quality_metrics_from_covers(U: set,
+                                ref_nei: List[List[set]],
+                                cur_nei: List[List[set]]) -> Tuple[float, float, float]:
+    accs, bws, cons = [], [], []
+    for b in range(len(ref_nei)):
+        for i in range(len(ref_nei[b])):
+            X = ref_nei[b][i]
+            lower, upper = lower_upper_from_cover(cur_nei[b], X)
+            accs.append((len(lower)+EPS_DENOM)/(len(upper)+EPS_DENOM))
+            bws.append((len(upper)-len(lower))/(len(U)+EPS_DENOM))
+            Y = cur_nei[b][i]
+            union = len(X | Y)
+            sym   = len((X - Y) | (Y - X))
+            cons.append(1.0 - sym/(union+EPS_DENOM))
+    return float(np.mean(accs)), float(np.mean(bws)), float(np.mean(cons))
+
+def composite_objective(acc: float,
+                        bw: float,
+                        con: float,
+                        wvec: np.ndarray) -> float:
+    return (
+        ALPHA_ACC * acc
+        - BETA_BW   * bw
+        + GAMMA_CON * con
+        - LAMBDA_L2 * float(np.dot(wvec, wvec))
+    )
+
+
+# ===================== Selection and weight learning =====================
+
+def uniform_weights(subset: List[str]) -> Dict[str, float]:
+    if not subset:
+        return {}
+    w = np.ones(len(subset)) / len(subset)
+    return dict(zip(subset, w))
+
+def apply_weight_floor_and_normalize(w: Dict[str, float]) -> Dict[str, float]:
+    if not w:
+        return {}
+    keys = list(w.keys())
+    arr = np.array([max(0.0, w[k]) for k in keys]) + EPS_WEIGHT_FLOOR
+    arr = arr / arr.sum()
+    return dict(zip(keys, arr))
+
+def learn_weights_by_marginal(values: pd.DataFrame,
+                              subset: List[str],
+                              ref_nei: List[List[set]]) -> Dict[str, float]:
+    if not subset:
+        return {}
+    w0 = uniform_weights(subset)
+    Q_all, _ = evaluate_subset(values, subset, w0, ref_nei)
+    deltas = []
+    for a in subset:
+        sub2 = [x for x in subset if x != a]
+        if not sub2:
+            deltas.append(0.0)
+            continue
+        Q_wo, _ = evaluate_subset(values, sub2, uniform_weights(sub2), ref_nei)
+        deltas.append(max(0.0, Q_all - Q_wo))
+    arr = np.array(deltas) + EPS_WEIGHT_FLOOR
+    arr = arr / arr.sum()
+    return dict(zip(subset, arr))
+
+def evaluate_subset(values: pd.DataFrame,
+                    subset: List[str],
+                    weights: Dict[str, float],
+                    ref_nei: List[List[set]]) -> Tuple[float, Dict[str, float]]:
+    if not subset:
+        return 0.0, dict(acc=0.0, bw=1.0, con=0.0)
+    S, mask = build_similarity(values, subset, weights)
+    thr = quantile_thresholds(S, mask, BETA_LEVELS)
+    nei = neighborhoods_from_S(S, thr)
+    U = set(range(S.shape[0]))
+    acc, bw, con = quality_metrics_from_covers(U, ref_nei, nei)
+    Q = composite_objective(acc, bw, con, np.array([weights[a] for a in subset]))
+    return Q, dict(acc=acc, bw=bw, con=con)
+
+def forward_selection(values: pd.DataFrame,
+                      candidates: List[str],
+                      ref_nei: List[List[set]]) -> Tuple[List[str], Dict[str, float]]:
+    selected, remaining = [], candidates.copy()
+    Q_cur = 0.0
+    while len(selected) < MAX_SELECTED and remaining:
+        best_gain, best_attr = -np.inf, None
+        for a in remaining:
+            Q_new, _ = evaluate_subset(values, selected+[a],
+                                       uniform_weights(selected+[a]),
+                                       ref_nei)
+            if Q_new - Q_cur > best_gain:
+                best_gain, best_attr = Q_new - Q_cur, a
+        if len(selected) >= MIN_SELECTED and best_gain < MARGINAL_EPS:
+            break
+        selected.append(best_attr)
+        remaining.remove(best_attr)
+        weights = apply_weight_floor_and_normalize(
+            learn_weights_by_marginal(values, selected, ref_nei)
+        )
+        Q_cur, _ = evaluate_subset(values, selected, weights, ref_nei)
+    return selected, weights
